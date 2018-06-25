@@ -1,11 +1,8 @@
 ﻿#include <assert.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <math.h>
-#include <vector>
-#include <algorithm>
-#include <execution>
 #include <immintrin.h>
-#define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
@@ -29,33 +26,47 @@ struct alignas(32) ComplexPacket
     __m256d re, im;
 };
 
+struct alignas(64) WorkerThread
+{
+    double zoom;
+    double position[2];
+    uint8_t* displayPtr;
+    HANDLE handle;
+    HANDLE beginEvent;
+    HANDLE endEvent;
+};
+
 struct Demo
 {
     double zoom;
     double position[2];
+    uint8_t* displayPtr;
     HWND window;
     HDC windowDevCtx;
     HDC memoryDevCtx;
-    uint8_t* displayPtr;
+    uint32_t numWorkerThreads;
+    WorkerThread workerThreads[k_MaxNumThreads];
 };
 
-static __m256d s_0_5;
-static __m256d s_1_0;
-static __m256d s_100_0;
+alignas(64) static uint32_t s_TileIndex[16];
+
+static const __m256d s_0_5 = _mm256_set1_pd(0.5);
+static const __m256d s_1_0 = _mm256_set1_pd(1.0);
+static const __m256d s_100_0 = _mm256_set1_pd(100.0);
 
 static double
 GetTime()
 {
-    static LARGE_INTEGER counter0;
+    static LARGE_INTEGER startCounter;
     static LARGE_INTEGER frequency;
-    if (counter0.QuadPart == 0)
+    if (startCounter.QuadPart == 0)
     {
         QueryPerformanceFrequency(&frequency);
-        QueryPerformanceCounter(&counter0);
+        QueryPerformanceCounter(&startCounter);
     }
     LARGE_INTEGER counter;
     QueryPerformanceCounter(&counter);
-    return (counter.QuadPart - counter0.QuadPart) / (double)frequency.QuadPart;
+    return (counter.QuadPart - startCounter.QuadPart) / (double)frequency.QuadPart;
 }
 
 static void
@@ -108,7 +119,7 @@ ProcessWindowMessage(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
 }
 
 static void
-Initialize(Demo& demo)
+InitializeWindow(Demo& demo)
 {
     WNDCLASS winclass = {};
     winclass.lpfnWndProc = ProcessWindowMessage;
@@ -128,6 +139,7 @@ Initialize(Demo& demo)
         rect.right - rect.left, rect.bottom - rect.top,
         nullptr, nullptr, nullptr, 0);
     assert(demo.window);
+
     demo.windowDevCtx = GetDC(demo.window);
     assert(demo.windowDevCtx);
 
@@ -139,16 +151,17 @@ Initialize(Demo& demo)
     bi.bmiHeader.biWidth = k_DemoResolutionX;
     bi.bmiHeader.biHeight = k_DemoResolutionY;
     bi.bmiHeader.biSizeImage = k_DemoResolutionX * k_DemoResolutionY;
-    HBITMAP hbm = CreateDIBSection(demo.windowDevCtx, &bi, DIB_RGB_COLORS, (void**)&demo.displayPtr, NULL, 0);
+    HBITMAP hbm = CreateDIBSection(demo.windowDevCtx, &bi, DIB_RGB_COLORS, (void**)&demo.displayPtr, nullptr, 0);
     assert(hbm);
 
     demo.memoryDevCtx = CreateCompatibleDC(demo.windowDevCtx);
     assert(demo.memoryDevCtx);
+
     SelectObject(demo.memoryDevCtx, hbm);
 }
 
 static __forceinline ComplexPacket
-ComplexPacketMul(ComplexPacket a, ComplexPacket b)
+Mul(ComplexPacket a, ComplexPacket b)
 {
     ComplexPacket ab;
 
@@ -162,7 +175,7 @@ ComplexPacketMul(ComplexPacket a, ComplexPacket b)
 }
 
 static __forceinline ComplexPacket
-ComplexPacketSqr(ComplexPacket a)
+Sqr(ComplexPacket a)
 {
     ComplexPacket aa;
 
@@ -189,11 +202,11 @@ ComputeDistance(__m256d vcx, __m256d vcy, int bailout)
         if (_mm256_movemask_pd(lessMask) == 0)
             break;
 
-        ComplexPacket dzN = ComplexPacketMul(z, dz);
+        ComplexPacket dzN = Mul(z, dz);
         dzN.re = _mm256_add_pd(_mm256_add_pd(dzN.re, dzN.re), s_1_0);
         dzN.im = _mm256_add_pd(dzN.im, dzN.im);
 
-        ComplexPacket zN = ComplexPacketSqr(z);
+        ComplexPacket zN = Sqr(z);
         zN.re = _mm256_add_pd(zN.re, vcx);
         zN.im = _mm256_add_pd(zN.im, vcy);
 
@@ -219,28 +232,155 @@ ComputeDistance(__m256d vcx, __m256d vcy, int bailout)
     return _mm256_andnot_pd(lessMask, dist);
 }
 
+static void
+DrawTile(uint32_t tileIndex, uint8_t* displayPtr, double zoom, double positionX, double positionY)
+{
+    const uint32_t x0 = (tileIndex % k_NumTilesX) * k_TileSize;
+    const uint32_t y0 = (tileIndex / k_NumTilesX) * k_TileSize;
+    const uint32_t x1 = x0 + k_TileSize;
+    const uint32_t y1 = y0 + k_TileSize;
+
+    __m256d xOffsets = _mm256_set_pd(3.0f, 2.0f, 1.0f, 0.0f);
+    __m256d rcpResX = _mm256_set1_pd(k_DemoRcpResolutionX);
+    __m256d aspectRatio = _mm256_set1_pd(k_DemoAspectRatio);
+    __m256d vzoom = _mm256_broadcast_sd(&zoom);
+    __m256d vposx = _mm256_broadcast_sd(&positionX);
+
+    for (uint32_t y = y0; y < y1; ++y)
+    {
+        double cy = 2.0 * (y * k_DemoRcpResolutionY - 0.5);
+        cy = (cy * zoom) - positionY;
+        const __m256d vcy = _mm256_broadcast_sd(&cy);
+
+        for (uint32_t x = x0; x < x1; x += 4)
+        {
+            // vcx = 2.0 * (x * k_DemoRcpResolutionX - 0.5) * k_DemoAspectRatio;
+            const double xd = (double)x;
+            __m256d vcx = _mm256_add_pd(_mm256_broadcast_sd(&xd), xOffsets);
+            vcx = _mm256_sub_pd(_mm256_mul_pd(vcx, rcpResX), s_0_5);
+            vcx = _mm256_mul_pd(_mm256_add_pd(vcx, vcx), aspectRatio);
+
+            // vcx = (vcx * vzoom) - vposx;
+            vcx = _mm256_sub_pd(_mm256_mul_pd(vcx, vzoom), vposx);
+
+            __m256d d = ComputeDistance(vcx, vcy, 32);
+            d = _mm256_sqrt_pd(_mm256_sqrt_pd(_mm256_div_pd(d, vzoom)));
+            d = _mm256_min_pd(d, s_1_0);
+
+            alignas(32) double ds[4];
+            _mm256_store_pd(ds, d);
+            const uint32_t idx = (x + y * k_DemoResolutionX) * 4;
+            displayPtr[idx +  0] = (uint8_t)(255.0 * ds[0]);
+            displayPtr[idx +  1] = (uint8_t)(255.0 * ds[0]);
+            displayPtr[idx +  2] = (uint8_t)(255.0 * ds[0]);
+            displayPtr[idx +  3] = 255;
+            displayPtr[idx +  4] = (uint8_t)(255.0 * ds[1]);
+            displayPtr[idx +  5] = (uint8_t)(255.0 * ds[1]);
+            displayPtr[idx +  6] = (uint8_t)(255.0 * ds[1]);
+            displayPtr[idx +  7] = 255;
+            displayPtr[idx +  8] = (uint8_t)(255.0 * ds[2]);
+            displayPtr[idx +  9] = (uint8_t)(255.0 * ds[2]);
+            displayPtr[idx + 10] = (uint8_t)(255.0 * ds[2]);
+            displayPtr[idx + 11] = 255;
+            displayPtr[idx + 12] = (uint8_t)(255.0 * ds[3]);
+            displayPtr[idx + 13] = (uint8_t)(255.0 * ds[3]);
+            displayPtr[idx + 14] = (uint8_t)(255.0 * ds[3]);
+            displayPtr[idx + 15] = 255;
+        }
+    }
+}
+
+static void
+DrawTiles(uint8_t* displayPtr, double zoom, double positionX, double positionY)
+{
+    for (;;)
+    {
+        const uint32_t idx = (uint32_t)_InterlockedIncrement(s_TileIndex) - 1;
+        if (idx >= k_NumTiles)
+            break;
+
+        DrawTile(idx, displayPtr, zoom, positionX, positionY);
+    }
+}
+
+static DWORD WINAPI
+DrawTilesThread(void* param)
+{
+    WorkerThread& thread = *(WorkerThread*)param;
+
+    for (;;)
+    {
+        WaitForSingleObject(thread.beginEvent, INFINITE);
+
+        DrawTiles(thread.displayPtr, thread.zoom, thread.position[0], thread.position[1]);
+
+        SetEvent(thread.endEvent);
+    }
+}
+
+static void
+Draw(Demo& demo)
+{
+    s_TileIndex[0] = 0;
+
+    HANDLE waitList[k_MaxNumThreads];
+    for (uint32_t i = 0; i < demo.numWorkerThreads; ++i)
+    {
+        demo.workerThreads[i].zoom = demo.zoom;
+        demo.workerThreads[i].position[0] = demo.position[0];
+        demo.workerThreads[i].position[1] = demo.position[1];
+
+        waitList[i] = demo.workerThreads[i].endEvent;
+        SetEvent(demo.workerThreads[i].beginEvent);
+    }
+    DrawTiles(demo.displayPtr, demo.zoom, demo.position[0], demo.position[1]);
+
+    WaitForMultipleObjects(demo.numWorkerThreads, waitList, TRUE, INFINITE);
+
+    BitBlt(demo.windowDevCtx, 0, 0, k_DemoResolutionX, k_DemoResolutionY, demo.memoryDevCtx, 0, 0, SRCCOPY);
+}
+
+static void
+InitializeWorkerThreads(Demo& demo)
+{
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    demo.numWorkerThreads = (uint32_t)(si.dwNumberOfProcessors - 1);
+
+    for (uint32_t i = 0; i < demo.numWorkerThreads; ++i)
+    {
+        demo.workerThreads[i].displayPtr = demo.displayPtr;
+        demo.workerThreads[i].handle = nullptr;
+        demo.workerThreads[i].beginEvent = CreateEventEx(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
+        demo.workerThreads[i].endEvent = CreateEventEx(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
+
+        assert(demo.workerThreads[i].beginEvent);
+        assert(demo.workerThreads[i].endEvent);
+    }
+
+    for (uint32_t i = 0; i < demo.numWorkerThreads; ++i)
+    {
+        demo.workerThreads[i].handle = CreateThread(nullptr, 0, DrawTilesThread, (void*)&demo.workerThreads[i], 0, nullptr);
+        assert(demo.workerThreads[i].handle);
+    }
+}
+
 int CALLBACK
 WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 {
     SetProcessDPIAware();
 
     Demo demo = {};
-    Initialize(demo);
     demo.zoom = 0.8;
     demo.position[0] = 0.5;
     demo.position[1] = 0.1;
 
-    std::vector<uint32_t> tiles;
-    for (uint32_t i = 0; i < k_NumTiles; ++i)
-        tiles.push_back(i);
-
-    s_0_5 = _mm256_set1_pd(0.5);
-    s_1_0 = _mm256_set1_pd(1.0);
-    s_100_0 = _mm256_set1_pd(100.0);
+    InitializeWindow(demo);
+    InitializeWorkerThreads(demo);
 
     for (;;)
     {
-        MSG msg = {};
+        MSG msg = { 0 };
         if (PeekMessage(&msg, 0, 0, 0, PM_REMOVE))
         {
             DispatchMessage(&msg);
@@ -267,68 +407,10 @@ WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
             if (GetAsyncKeyState(VK_DOWN) & 0x8000)
                 demo.position[1] += deltaTime * demo.zoom;
 
-            std::for_each(std::execution::par, std::begin(tiles), std::end(tiles), [&demo](uint32_t tileIndex)
-            {
-                uint32_t x0 = (tileIndex % k_NumTilesX) * k_TileSize;
-                uint32_t y0 = (tileIndex / k_NumTilesX) * k_TileSize;
-                uint32_t x1 = x0 + k_TileSize;
-                uint32_t y1 = y0 + k_TileSize;
-                uint8_t* displayPtr = demo.displayPtr;
-
-                __m256d xOffsets = _mm256_set_pd(3.0f, 2.0f, 1.0f, 0.0f);
-                __m256d rcpResX = _mm256_set1_pd(k_DemoRcpResolutionX);
-                __m256d aspectRatio = _mm256_set1_pd(k_DemoAspectRatio);
-                __m256d zoom = _mm256_broadcast_sd(&demo.zoom);
-                __m256d posX = _mm256_broadcast_sd(&demo.position[0]);
-
-                for (uint32_t y = y0; y < y1; ++y)
-                {
-                    double cy = 2.0 * (y * k_DemoRcpResolutionY - 0.5);
-                    cy = (cy * demo.zoom) - demo.position[1];
-                    __m256d vcy = _mm256_broadcast_sd(&cy);
-
-                    for (uint32_t x = x0; x < x1; x += 4)
-                    {
-                        // vcx = 2.0 * (x * k_DemoRcpResolutionX - 0.5) * k_DemoAspectRatio;
-                        double xd = (double)x;
-                        __m256d vcx = _mm256_add_pd(_mm256_broadcast_sd(&xd), xOffsets);
-                        vcx = _mm256_sub_pd(_mm256_mul_pd(vcx, rcpResX), s_0_5);
-                        vcx = _mm256_mul_pd(_mm256_add_pd(vcx, vcx), aspectRatio);
-
-                        // vcx = (vcx * demo.zoom) - demo.position[0];
-                        vcx = _mm256_sub_pd(_mm256_mul_pd(vcx, zoom), posX);
-
-                        __m256d d = ComputeDistance(vcx, vcy, 256);
-                        d = _mm256_sqrt_pd(_mm256_sqrt_pd(_mm256_div_pd(d, zoom)));
-                        d = _mm256_min_pd(d, s_1_0);
-
-                        alignas(32) double ds[4];
-                        _mm256_store_pd(ds, d);
-                        uint32_t idx = (x + y * k_DemoResolutionX) * 4;
-                        displayPtr[idx +  0] = (uint8_t)(255.0 * ds[0]);
-                        displayPtr[idx +  1] = (uint8_t)(255.0 * ds[0]);
-                        displayPtr[idx +  2] = (uint8_t)(255.0 * ds[0]);
-                        displayPtr[idx +  3] = 255;
-                        displayPtr[idx +  4] = (uint8_t)(255.0 * ds[1]);
-                        displayPtr[idx +  5] = (uint8_t)(255.0 * ds[1]);
-                        displayPtr[idx +  6] = (uint8_t)(255.0 * ds[1]);
-                        displayPtr[idx +  7] = 255;
-                        displayPtr[idx +  8] = (uint8_t)(255.0 * ds[2]);
-                        displayPtr[idx +  9] = (uint8_t)(255.0 * ds[2]);
-                        displayPtr[idx + 10] = (uint8_t)(255.0 * ds[2]);
-                        displayPtr[idx + 11] = 255;
-                        displayPtr[idx + 12] = (uint8_t)(255.0 * ds[3]);
-                        displayPtr[idx + 13] = (uint8_t)(255.0 * ds[3]);
-                        displayPtr[idx + 14] = (uint8_t)(255.0 * ds[3]);
-                        displayPtr[idx + 15] = 255;
-                    }
-                }
-            });
-
-            BitBlt(demo.windowDevCtx, 0, 0, k_DemoResolutionX, k_DemoResolutionY, demo.memoryDevCtx, 0, 0, SRCCOPY);
+            Draw(demo);
         }
     }
 
     return 0;
 }
-// vim: set ts=4 sw=4 expandtab:
+// vim: ts=4 sw=4 expandtab:
