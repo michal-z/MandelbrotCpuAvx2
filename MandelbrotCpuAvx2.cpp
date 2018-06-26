@@ -14,7 +14,7 @@
 #define k_DemoRcpResolutionY (1.0f / k_DemoResolutionY)
 #define k_DemoAspectRatio ((float)k_DemoResolutionX / k_DemoResolutionY)
 
-#define k_TileSize 40
+#define k_TileSize 16
 #define k_NumTilesX (k_DemoResolutionX / k_TileSize)
 #define k_NumTilesY (k_DemoResolutionY / k_TileSize)
 #define k_NumTiles (k_NumTilesX * k_NumTilesY)
