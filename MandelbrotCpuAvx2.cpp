@@ -7,14 +7,14 @@
 #include <windows.h>
 
 
-#define k_DemoName "Mandelbrot (CPU, AVX2, Double-precision)"
+#define k_DemoName "Mandelbrot (CPU, AVX2)"
 #define k_DemoResolutionX 1280
 #define k_DemoResolutionY 720
-#define k_DemoRcpResolutionX (1.0 / k_DemoResolutionX)
-#define k_DemoRcpResolutionY (1.0 / k_DemoResolutionY)
-#define k_DemoAspectRatio ((double)k_DemoResolutionX / k_DemoResolutionY)
+#define k_DemoRcpResolutionX (1.0f / k_DemoResolutionX)
+#define k_DemoRcpResolutionY (1.0f / k_DemoResolutionY)
+#define k_DemoAspectRatio ((float)k_DemoResolutionX / k_DemoResolutionY)
 
-#define k_TileSize 20
+#define k_TileSize 40
 #define k_NumTilesX (k_DemoResolutionX / k_TileSize)
 #define k_NumTilesY (k_DemoResolutionY / k_TileSize)
 #define k_NumTiles (k_NumTilesX * k_NumTilesY)
@@ -23,13 +23,13 @@
 
 struct alignas(32) ComplexPacket
 {
-    __m256d re, im;
+    __m256 re, im;
 };
 
 struct alignas(64) WorkerThread
 {
-    double zoom;
-    double position[2];
+    float zoom;
+    float position[2];
     uint8_t* displayPtr;
     HANDLE handle;
     HANDLE beginEvent;
@@ -38,8 +38,8 @@ struct alignas(64) WorkerThread
 
 struct Demo
 {
-    double zoom;
-    double position[2];
+    float zoom;
+    float position[2];
     uint8_t* displayPtr;
     HWND window;
     HDC windowDevCtx;
@@ -50,9 +50,9 @@ struct Demo
 
 alignas(64) static uint32_t s_TileIndex[16];
 
-static const __m256d s_0_5 = _mm256_set1_pd(0.5);
-static const __m256d s_1_0 = _mm256_set1_pd(1.0);
-static const __m256d s_100_0 = _mm256_set1_pd(100.0);
+static const __m256 s_0_5 = _mm256_set1_ps(0.5f);
+static const __m256 s_1_0 = _mm256_set1_ps(1.0f);
+static const __m256 s_100_0 = _mm256_set1_ps(100.0f);
 
 static double
 GetTime()
@@ -70,7 +70,7 @@ GetTime()
 }
 
 static void
-UpdateFrameTime(HWND window, double& o_Time, double& o_DeltaTime)
+UpdateFrameTime(HWND window, double& o_Time, float& o_DeltaTime)
 {
     static double lastTime = -1.0;
     static double lastFpsTime = 0.0;
@@ -83,7 +83,7 @@ UpdateFrameTime(HWND window, double& o_Time, double& o_DeltaTime)
     }
 
     o_Time = GetTime();
-    o_DeltaTime = o_Time - lastTime;
+    o_DeltaTime = (float)(o_Time - lastTime);
     lastTime = o_Time;
 
     if ((o_Time - lastFpsTime) >= 1.0)
@@ -166,10 +166,10 @@ Mul(ComplexPacket a, ComplexPacket b)
     ComplexPacket ab;
 
     // ab.re = a.re * b.re - a.im * b.im;
-    ab.re = _mm256_sub_pd(_mm256_mul_pd(a.re, b.re), _mm256_mul_pd(a.im, b.im));
+    ab.re = _mm256_sub_ps(_mm256_mul_ps(a.re, b.re), _mm256_mul_ps(a.im, b.im));
 
     // ab.im = a.re * b.im + a.im * b.re;
-    ab.im = _mm256_add_pd(_mm256_mul_pd(a.re, b.im), _mm256_mul_pd(a.im, b.re));
+    ab.im = _mm256_add_ps(_mm256_mul_ps(a.re, b.im), _mm256_mul_ps(a.im, b.re));
 
     return ab;
 }
@@ -180,118 +180,138 @@ Sqr(ComplexPacket a)
     ComplexPacket aa;
 
     // aa.re = a.re * a.re - a.im * a.im;
-    aa.re = _mm256_sub_pd(_mm256_mul_pd(a.re, a.re), _mm256_mul_pd(a.im, a.im));
+    aa.re = _mm256_sub_ps(_mm256_mul_ps(a.re, a.re), _mm256_mul_ps(a.im, a.im));
 
     // aa.im = 2.0f * a.re * a.im;
-    aa.im = _mm256_mul_pd(_mm256_add_pd(a.re, a.re), a.im);
+    aa.im = _mm256_mul_ps(_mm256_add_ps(a.re, a.re), a.im);
 
     return aa;
 }
 
-static __m256d
-ComputeDistance(__m256d vcx, __m256d vcy, int bailout)
+static __m256
+ComputeDistance(__m256 vcx, __m256 vcy, uint32_t bailout)
 {
-    ComplexPacket z = { _mm256_setzero_pd(), _mm256_setzero_pd() };
-    ComplexPacket dz = { s_1_0, _mm256_setzero_pd() };
-    __m256d m2, lessMask;
+    ComplexPacket z = { _mm256_setzero_ps(), _mm256_setzero_ps() };
+    ComplexPacket dz = { s_1_0, _mm256_setzero_ps() };
+    __m256 m2, lessMask;
 
-    while (bailout--)
+    do
     {
-        m2 = _mm256_add_pd(_mm256_mul_pd(z.re, z.re), _mm256_mul_pd(z.im, z.im));
-        lessMask = _mm256_cmp_pd(m2, s_100_0, _CMP_LE_OQ);
-        if (_mm256_movemask_pd(lessMask) == 0)
+        m2 = _mm256_add_ps(_mm256_mul_ps(z.re, z.re), _mm256_mul_ps(z.im, z.im));
+        lessMask = _mm256_cmp_ps(m2, s_100_0, _CMP_LE_OQ);
+        if (_mm256_movemask_ps(lessMask) == 0)
             break;
 
         ComplexPacket dzN = Mul(z, dz);
-        dzN.re = _mm256_add_pd(_mm256_add_pd(dzN.re, dzN.re), s_1_0);
-        dzN.im = _mm256_add_pd(dzN.im, dzN.im);
+        dzN.re = _mm256_add_ps(_mm256_add_ps(dzN.re, dzN.re), s_1_0);
+        dzN.im = _mm256_add_ps(dzN.im, dzN.im);
 
         ComplexPacket zN = Sqr(z);
-        zN.re = _mm256_add_pd(zN.re, vcx);
-        zN.im = _mm256_add_pd(zN.im, vcy);
+        zN.re = _mm256_add_ps(zN.re, vcx);
+        zN.im = _mm256_add_ps(zN.im, vcy);
 
-        z.re = _mm256_blendv_pd(z.re, zN.re, lessMask);
-        z.im = _mm256_blendv_pd(z.im, zN.im, lessMask);
-        dz.re = _mm256_blendv_pd(dz.re, dzN.re, lessMask);
-        dz.im = _mm256_blendv_pd(dz.im, dzN.im, lessMask);
-    }
+        z.re = _mm256_blendv_ps(z.re, zN.re, lessMask);
+        z.im = _mm256_blendv_ps(z.im, zN.im, lessMask);
+        dz.re = _mm256_blendv_ps(dz.re, dzN.re, lessMask);
+        dz.im = _mm256_blendv_ps(dz.im, dzN.im, lessMask);
+    } while (--bailout);
 
-    alignas(32) double logTemp[4];
-    _mm256_store_pd(logTemp, m2);
-    logTemp[0] = log(logTemp[0]);
-    logTemp[1] = log(logTemp[1]);
-    logTemp[2] = log(logTemp[2]);
-    logTemp[3] = log(logTemp[3]);
-    __m256d logRes = _mm256_load_pd(logTemp);
+    alignas(32) float logTemp[8];
+    _mm256_store_ps(logTemp, m2);
+    logTemp[0] = logf(logTemp[0]);
+    logTemp[1] = logf(logTemp[1]);
+    logTemp[2] = logf(logTemp[2]);
+    logTemp[3] = logf(logTemp[3]);
+    logTemp[4] = logf(logTemp[4]);
+    logTemp[5] = logf(logTemp[5]);
+    logTemp[6] = logf(logTemp[6]);
+    logTemp[7] = logf(logTemp[7]);
+    __m256 logRes = _mm256_load_ps(logTemp);
 
-    __m256d dzDot2 = _mm256_add_pd(_mm256_mul_pd(dz.re, dz.re), _mm256_mul_pd(dz.im, dz.im));
+    __m256 dzDot2 = _mm256_add_ps(_mm256_mul_ps(dz.re, dz.re), _mm256_mul_ps(dz.im, dz.im));
 
-    __m256d dist = _mm256_sqrt_pd(_mm256_div_pd(m2, dzDot2));
-    dist = _mm256_mul_pd(logRes, _mm256_mul_pd(dist, s_0_5));
+    __m256 dist = _mm256_sqrt_ps(_mm256_div_ps(m2, dzDot2));
+    dist = _mm256_mul_ps(logRes, _mm256_mul_ps(dist, s_0_5));
 
-    return _mm256_andnot_pd(lessMask, dist);
+    return _mm256_andnot_ps(lessMask, dist);
 }
 
 static void
-DrawTile(uint32_t tileIndex, uint8_t* displayPtr, double zoom, double positionX, double positionY)
+DrawTile(uint32_t tileIndex, uint8_t* displayPtr, float zoom, float positionX, float positionY)
 {
     const uint32_t x0 = (tileIndex % k_NumTilesX) * k_TileSize;
     const uint32_t y0 = (tileIndex / k_NumTilesX) * k_TileSize;
     const uint32_t x1 = x0 + k_TileSize;
     const uint32_t y1 = y0 + k_TileSize;
 
-    __m256d xOffsets = _mm256_set_pd(3.0f, 2.0f, 1.0f, 0.0f);
-    __m256d rcpResX = _mm256_set1_pd(k_DemoRcpResolutionX);
-    __m256d aspectRatio = _mm256_set1_pd(k_DemoAspectRatio);
-    __m256d vzoom = _mm256_broadcast_sd(&zoom);
-    __m256d vposx = _mm256_broadcast_sd(&positionX);
+    const __m256 xOffsets = _mm256_set_ps(7.0f, 6.0f, 5.0f, 4.0f, 3.0f, 2.0f, 1.0f, 0.0f);
+    const __m256 rcpResX = _mm256_set1_ps(k_DemoRcpResolutionX);
+    const __m256 aspectRatio = _mm256_set1_ps(k_DemoAspectRatio);
+    const __m256 vzoom = _mm256_broadcast_ss(&zoom);
+    const __m256 vposx = _mm256_broadcast_ss(&positionX);
 
     for (uint32_t y = y0; y < y1; ++y)
     {
-        double cy = 2.0 * (y * k_DemoRcpResolutionY - 0.5);
+        float cy = 2.0f * (y * k_DemoRcpResolutionY - 0.5f);
         cy = (cy * zoom) - positionY;
-        const __m256d vcy = _mm256_broadcast_sd(&cy);
+        const __m256 vcy = _mm256_broadcast_ss(&cy);
 
-        for (uint32_t x = x0; x < x1; x += 4)
+        for (uint32_t x = x0; x < x1; x += 8)
         {
-            // vcx = 2.0 * (x * k_DemoRcpResolutionX - 0.5) * k_DemoAspectRatio;
-            const double xd = (double)x;
-            __m256d vcx = _mm256_add_pd(_mm256_broadcast_sd(&xd), xOffsets);
-            vcx = _mm256_sub_pd(_mm256_mul_pd(vcx, rcpResX), s_0_5);
-            vcx = _mm256_mul_pd(_mm256_add_pd(vcx, vcx), aspectRatio);
+            // vcx = 2.0f * (x * k_DemoRcpResolutionX - 0.5f) * k_DemoAspectRatio;
+            const float xf = (float)x;
+            __m256 vcx = _mm256_add_ps(_mm256_broadcast_ss(&xf), xOffsets);
+            vcx = _mm256_sub_ps(_mm256_mul_ps(vcx, rcpResX), s_0_5);
+            vcx = _mm256_mul_ps(_mm256_add_ps(vcx, vcx), aspectRatio);
 
             // vcx = (vcx * vzoom) - vposx;
-            vcx = _mm256_sub_pd(_mm256_mul_pd(vcx, vzoom), vposx);
+            vcx = _mm256_sub_ps(_mm256_mul_ps(vcx, vzoom), vposx);
 
-            __m256d d = ComputeDistance(vcx, vcy, 32);
-            d = _mm256_sqrt_pd(_mm256_sqrt_pd(_mm256_div_pd(d, vzoom)));
-            d = _mm256_min_pd(d, s_1_0);
+            __m256 d = ComputeDistance(vcx, vcy, 64);
+            d = _mm256_sqrt_ps(_mm256_sqrt_ps(_mm256_div_ps(d, vzoom)));
+            d = _mm256_min_ps(d, s_1_0);
 
-            alignas(32) double ds[4];
-            _mm256_store_pd(ds, d);
+            alignas(32) float ds[8];
+            _mm256_store_ps(ds, d);
             const uint32_t idx = (x + y * k_DemoResolutionX) * 4;
-            displayPtr[idx +  0] = (uint8_t)(255.0 * ds[0]);
-            displayPtr[idx +  1] = (uint8_t)(255.0 * ds[0]);
-            displayPtr[idx +  2] = (uint8_t)(255.0 * ds[0]);
+            displayPtr[idx +  0] = (uint8_t)(255.0f * ds[0]);
+            displayPtr[idx +  1] = (uint8_t)(255.0f * ds[0]);
+            displayPtr[idx +  2] = (uint8_t)(255.0f * ds[0]);
             displayPtr[idx +  3] = 255;
-            displayPtr[idx +  4] = (uint8_t)(255.0 * ds[1]);
-            displayPtr[idx +  5] = (uint8_t)(255.0 * ds[1]);
-            displayPtr[idx +  6] = (uint8_t)(255.0 * ds[1]);
+            displayPtr[idx +  4] = (uint8_t)(255.0f * ds[1]);
+            displayPtr[idx +  5] = (uint8_t)(255.0f * ds[1]);
+            displayPtr[idx +  6] = (uint8_t)(255.0f * ds[1]);
             displayPtr[idx +  7] = 255;
-            displayPtr[idx +  8] = (uint8_t)(255.0 * ds[2]);
-            displayPtr[idx +  9] = (uint8_t)(255.0 * ds[2]);
-            displayPtr[idx + 10] = (uint8_t)(255.0 * ds[2]);
+            displayPtr[idx +  8] = (uint8_t)(255.0f * ds[2]);
+            displayPtr[idx +  9] = (uint8_t)(255.0f * ds[2]);
+            displayPtr[idx + 10] = (uint8_t)(255.0f * ds[2]);
             displayPtr[idx + 11] = 255;
-            displayPtr[idx + 12] = (uint8_t)(255.0 * ds[3]);
-            displayPtr[idx + 13] = (uint8_t)(255.0 * ds[3]);
-            displayPtr[idx + 14] = (uint8_t)(255.0 * ds[3]);
+            displayPtr[idx + 12] = (uint8_t)(255.0f * ds[3]);
+            displayPtr[idx + 13] = (uint8_t)(255.0f * ds[3]);
+            displayPtr[idx + 14] = (uint8_t)(255.0f * ds[3]);
             displayPtr[idx + 15] = 255;
+            displayPtr[idx + 16] = (uint8_t)(255.0f * ds[4]);
+            displayPtr[idx + 17] = (uint8_t)(255.0f * ds[4]);
+            displayPtr[idx + 18] = (uint8_t)(255.0f * ds[4]);
+            displayPtr[idx + 19] = 255;
+            displayPtr[idx + 20] = (uint8_t)(255.0f * ds[5]);
+            displayPtr[idx + 21] = (uint8_t)(255.0f * ds[5]);
+            displayPtr[idx + 22] = (uint8_t)(255.0f * ds[5]);
+            displayPtr[idx + 23] = 255;
+            displayPtr[idx + 24] = (uint8_t)(255.0f * ds[6]);
+            displayPtr[idx + 25] = (uint8_t)(255.0f * ds[6]);
+            displayPtr[idx + 26] = (uint8_t)(255.0f * ds[6]);
+            displayPtr[idx + 27] = 255;
+            displayPtr[idx + 28] = (uint8_t)(255.0f * ds[7]);
+            displayPtr[idx + 29] = (uint8_t)(255.0f * ds[7]);
+            displayPtr[idx + 30] = (uint8_t)(255.0f * ds[7]);
+            displayPtr[idx + 31] = 255;
         }
     }
 }
 
 static void
-DrawTiles(uint8_t* displayPtr, double zoom, double positionX, double positionY)
+DrawTiles(uint8_t* displayPtr, float zoom, float positionX, float positionY)
 {
     for (;;)
     {
@@ -389,7 +409,8 @@ WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         }
         else
         {
-            double time, deltaTime;
+            double time;
+            float deltaTime;
             UpdateFrameTime(demo.window, time, deltaTime);
 
             if (GetAsyncKeyState('A') & 0x8000)
