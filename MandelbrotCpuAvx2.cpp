@@ -188,6 +188,24 @@ Sqr(ComplexPacket a)
     return aa;
 }
 
+#ifndef __INTEL_COMPILER
+static __forceinline __m256 __vectorcall
+_mm256_log_ps(__m256 v)
+{
+    alignas(32) float temp[8];
+    _mm256_store_ps(temp, v);
+    temp[0] = logf(temp[0]);
+    temp[1] = logf(temp[1]);
+    temp[2] = logf(temp[2]);
+    temp[3] = logf(temp[3]);
+    temp[4] = logf(temp[4]);
+    temp[5] = logf(temp[5]);
+    temp[6] = logf(temp[6]);
+    temp[7] = logf(temp[7]);
+    return _mm256_load_ps(temp);
+}
+#endif
+
 static __m256
 ComputeDistance(__m256 vcx, __m256 vcy, uint32_t bailout)
 {
@@ -216,18 +234,7 @@ ComputeDistance(__m256 vcx, __m256 vcy, uint32_t bailout)
         dz.im = _mm256_blendv_ps(dz.im, dzN.im, lessMask);
     } while (--bailout);
 
-    alignas(32) float logTemp[8];
-    _mm256_store_ps(logTemp, m2);
-    logTemp[0] = logf(logTemp[0]);
-    logTemp[1] = logf(logTemp[1]);
-    logTemp[2] = logf(logTemp[2]);
-    logTemp[3] = logf(logTemp[3]);
-    logTemp[4] = logf(logTemp[4]);
-    logTemp[5] = logf(logTemp[5]);
-    logTemp[6] = logf(logTemp[6]);
-    logTemp[7] = logf(logTemp[7]);
-    __m256 logRes = _mm256_load_ps(logTemp);
-
+    __m256 logRes = _mm256_log_ps(m2);
     __m256 dzDot2 = _mm256_add_ps(_mm256_mul_ps(dz.re, dz.re), _mm256_mul_ps(dz.im, dz.im));
 
     __m256 dist = _mm256_sqrt_ps(_mm256_div_ps(m2, dzDot2));
