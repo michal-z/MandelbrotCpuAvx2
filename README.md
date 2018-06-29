@@ -1,4 +1,2 @@
 # MandelbrotCpuAvx2
- Real-time, double-precision Mandelbrot rendering on the CPU. Simple SIMD + Parallel STL test.
- 
- Arrow keys to move; A, Z to zoom.
+ Real-time Mandelbrot rendering on the CPU. Arrow keys to move. A, Z keys to zoom/unzoom.
